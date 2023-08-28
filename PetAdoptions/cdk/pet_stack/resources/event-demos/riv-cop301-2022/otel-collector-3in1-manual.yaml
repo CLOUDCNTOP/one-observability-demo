@@ -1,0 +1,197 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-collector-config
+  namespace: otel
+data:
+  otel-collector-config.yml: |
+    extensions:
+      sigv4auth:
+        region: "us-west-2"
+        service: "aps"
+      health_check:
+      pprof:
+        endpoint: :1888
+      zpages:
+        endpoint: :55679
+
+    receivers:
+      otlp:
+        protocols:
+          grpc:
+            endpoint: 0.0.0.0:4317          
+
+      prometheus:
+        config:
+          global:
+            scrape_interval: 15s
+            scrape_timeout: 10s
+
+          scrape_configs:
+          - job_name: 'cop301'
+            kubernetes_sd_configs:
+              - role: pod
+            relabel_configs:
+              - source_labels: [ __address__ ]
+                action: keep
+                regex: '.*:(8000)$'
+              - action: replace
+                source_labels: [__meta_kubernetes_pod_node_name]
+                target_label: nodename
+              - action: replace
+                source_labels: [__meta_kubernetes_namespace]
+                target_label: namespace
+              - action: replace
+                source_labels: [__meta_kubernetes_pod_name]
+                target_label: pod_name
+              - action: replace
+                source_labels: [__meta_kubernetes_pod_container_name]
+                target_label: container_name
+              - action: replace
+                source_labels: [__meta_kubernetes_pod_controller_kind]
+                target_label: pod_controller_kind
+
+    exporters:
+      # 指标
+      prometheusremotewrite:
+        endpoint: "${AMP_REMOTE_WRITE_URL}"
+        auth:
+          authenticator: sigv4auth
+      # 链路
+      awsxray:
+        region: us-west-2
+      # 日志
+      logging:
+        loglevel: info
+        #verbosity: detailed # loglevel 和 verbosity 互斥
+        #sampling_initial: 5
+        #sampling_thereafter: 200      
+      # OpenSearch 
+      otlp/data-prepper:
+        endpoint: data-prepper.data-prepper.svc.cluster.local:21890
+        tls:
+          insecure: true
+
+
+    service:
+      extensions: [pprof, zpages, health_check, sigv4auth]
+      pipelines:
+        #
+        # Metrics pipeline for collecting Prometheus metrics and sending them to Amazon Managed Prometheus
+        #
+        metrics:
+          receivers: [prometheus]
+          # processors: [batch/metrics]
+          # exporters: [prometheusremotewrite]
+          exporters: [logging, prometheusremotewrite]
+          # exporters: [logging, awsprometheusremotewrite]
+        traces:
+          receivers: [otlp]
+          exporters: [otlp/data-prepper]          
+        #   exporters: [logging, awsxray]         
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: otel-collector
+  name: otel-collector
+  namespace: otel
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: otel-collector
+  template:
+    metadata:
+      labels:
+        app: otel-collector
+    spec:
+      serviceAccountName: otel-admin-sa
+      containers:
+        - image: amazon/aws-otel-collector:latest
+          name: otel-collector
+          ports:
+            - containerPort: 4317
+            - containerPort: 8888
+          resources: # Verify the amount of requests
+            requests:
+              memory: "128Mi"
+              cpu: "250m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+          command: ["/awscollector"]
+          args: ["--config=/etc/otel-collector-config.yml"]
+          volumeMounts:
+            - name: config-volume
+              mountPath: /etc/otel-collector-config.yml
+              subPath: otel-collector-config.yml
+      volumes:
+        - name: config-volume
+          configMap:
+            name: otel-collector-config
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-collector
+  namespace: otel
+spec:
+  type: NodePort
+  ports:
+    - name: otlp
+      port: 4317
+      targetPort: 4317
+    - name: metrics # Default endpoint for querying metrics.
+      port: 8888
+      targetPort: 8888
+  selector:
+    app: otel-collector
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: otel-admin-role
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - nodes
+      - nodes/proxy
+      - services
+      - endpoints
+      - pods
+    verbs:
+      - get
+      - list
+      - watch
+  - apiGroups:
+      - extensions
+    resources:
+      - ingresses
+    verbs:
+      - get
+      - list
+      - watch
+  - nonResourceURLs:
+      - /metrics
+    verbs:
+      - get
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: otel-admin-role-binding
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: otel-admin-role
+subjects:
+  - kind: ServiceAccount
+    name: otel-admin-sa
+    namespace: otel
